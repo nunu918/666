@@ -4,53 +4,96 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get("/", async (req, res) => {
+// ---- 获取 Lighter BTC 价格（用你给我的接口） ----
+async function getLighterPrice() {
   try {
-    // ===== Lighter BTC 价格 =====
-    const lighterRes = await fetch("https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails");
-    const lighterData = await lighterRes.json();
+    const res = await fetch("https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=1", {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)"
+      }
+    });
 
-    const lighterPrice = lighterData?.order_book_details?.[0]?.last_trade_price;
+    const data = await res.json();
 
-    if (!lighterPrice) throw new Error("Lighter BTC price not found");
+    const details = data.order_book_details?.[0];
+    if (!details) return null;
 
-    // ===== Paradex BTC 价格 =====
-    const paraRes = await fetch("https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP");
-    const paraData = await paraRes.json();
-
-    const bid = paraData?.best_bid;
-    const ask = paraData?.best_ask;
-
-    if (!bid || !ask) throw new Error("Paradex BTC price not found");
-
-    const paradexPrice = (bid + ask) / 2; // 中间价（最稳）
-
-    // ===== 计算价差 =====
-    const spread = lighterPrice - paradexPrice;
-
-    // ===== 输出 HTML =====
-    res.send(`
-      <html>
-        <head><meta charset="utf-8"><title>BTC 价差监控</title></head>
-        <body style="font-family:Arial;padding:20px;">
-          <h2>BTC 价差监控（Lighter × Paradex）</h2>
-
-          <p>Lighter 价格：<b>${lighterPrice}</b></p>
-          <p>Paradex 价格：<b>${paradexPrice.toFixed(2)}</b></p>
-          <p>价差（Lighter - Paradex）：<b>${spread.toFixed(2)}</b></p>
-
-          <p style="color:gray;">（每 3 秒自动刷新）</p>
-
-          <script>
-            setTimeout(() => location.reload(), 3000);
-          </script>
-        </body>
-      </html>
-    `);
-
-  } catch (err) {
-    res.send("Error: " + err.message);
+    return details.last_trade_price; // 你浏览器能看到这个字段
+  } catch (e) {
+    return null;
   }
+}
+
+// ---- 获取 Paradex BTC 价格（你测试成功的端口） ----
+async function getParadexPrice() {
+  try {
+    const res = await fetch("https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP", {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
+        "Accept": "application/json"
+      }
+    });
+
+    const data = await res.json();
+
+    return {
+      bid: parseFloat(data.bid),
+      ask: parseFloat(data.ask)
+    };
+
+  } catch (e) {
+    return null;
+  }
+}
+
+app.get("/", async (req, res) => {
+  const lighter = await getLighterPrice();
+  const para = await getParadexPrice();
+
+  if (!lighter) {
+    return res.send("Error: Lighter price not found");
+  }
+  if (!para) {
+    return res.send("Error: Paradex price not found");
+  }
+
+  const diff = lighter - para.bid;
+
+  res.send(`
+    <html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>BTC 套利监控</title>
+      <style>
+        body { font-family: Arial; padding:20px; font-size:20px; }
+        .box { padding:15px; margin-top:15px; background:#f2f2f2; border-radius:8px; }
+      </style>
+    </head>
+    <body>
+
+      <h2>BTC 套利监控（Lighter × Paradex）</h2>
+
+      <div class="box">
+        <b>Lighter BTC：</b> ${lighter}
+      </div>
+
+      <div class="box">
+        <b>Paradex Bid：</b> ${para.bid}<br>
+        <b>Paradex Ask：</b> ${para.ask}
+      </div>
+
+      <div class="box">
+        <b>价差（Lighter - Paradex Bid）：</b> ${diff.toFixed(2)}
+      </div>
+
+      <script>
+        setTimeout(()=>location.reload(), 3000);
+      </script>
+    </body>
+    </html>
+  `);
 });
 
-app.listen(PORT, () => console.log("Server running on port", PORT));
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
