@@ -1,63 +1,66 @@
-const express = require("express");
-const fetch = require("node-fetch");
+import express from "express";
+import fetch from "node-fetch";
+
 const app = express();
 
 app.get("/", async (req, res) => {
-  try {
-    // ====== Lighter BTC ======
-    const lighterRes = await fetch(
-      "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=1"
-    );
-    const lighterJson = await lighterRes.json();
-    const lighterBTC = lighterJson?.order_book_details?.[0]?.last_trade_price;
+    try {
+        // ====== Lighter BTC ======
+        const lighterRes = await fetch(
+            "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails"
+        );
+        const lighterJson = await lighterRes.json();
+        const lighterBTC = lighterJson?.order_book_details?.[0]?.last_trade_price || 0;
 
-    // ====== Paradex ======
-    const paraRes = await fetch(
-      "https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP"
-    );
-    const paraJson = await paraRes.json();
-    const paraBid = paraJson?.bid;
-    const paraAsk = paraJson?.ask;
+        // ====== Paradex ======
+        const paraRes = await fetch(
+            "https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP"
+        );
+        const paraJson = await paraRes.json();
+        const paraBid = paraJson?.bid || 0;
+        const paraAsk = paraJson?.ask || 0;
 
-    // ====== spreads ======
-    const spreadA = lighterBTC - paraBid; // L 多 / P 空
-    const spreadB = paraAsk - lighterBTC; // P 多 / L 空
+        // ====== 两个方向价差 ======
+        const spreadA = lighterBTC - paraBid;   // L 多 - P 空
+        const spreadB = paraAsk - lighterBTC;   // P 多 - L 空
 
-    res.send(`
-      <html>
-      <head>
-        <meta charset="utf-8"/>
-        <title>BTC 套利监控</title>
-        <style>
-          body { font-family: Arial; padding:20px; background:#f2f2f2 }
-          .box{padding:12px;margin:12px 0;background:#fff;border-radius:8px;font-size:20px}
-          .title{font-weight:bold;font-size:22px;margin-bottom:10px}
-        </style>
-      </head>
-      <body>
+        // ====== 返回 HTML（只新增自动刷新标签） ======
+        res.send(`
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-        <div class="title">BTC 套利监控（Lighter × Paradex）</div>
+    <!-- ⭐⭐⭐ 只有这句是新增的：每 3 秒自动刷新 ⭐⭐⭐ -->
+    <meta http-equiv="refresh" content="3">
 
-        <div class="box">
-          <div>Lighter BTC：${lighterBTC}</div>
-        </div>
+    <title>BTC 套利监控（Lighter × Paradex）</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont; margin: 20px; }
+        .title { font-size: 20px; font-weight: 700; margin-bottom: 15px; }
+        .item { font-size: 18px; margin: 6px 0; }
+    </style>
+</head>
+<body>
 
-        <div class="box">
-          <div>Paradex Bid：${paraBid}</div>
-          <div>Paradex Ask：${paraAsk}</div>
-        </div>
+<div class="title">BTC 套利监控（Lighter × Paradex）</div>
 
-        <div class="box">
-          <div><b>方向 A（L 多 - P 空）：</b>${spreadA.toFixed(2)}</div>
-          <div><b>方向 B（P 多 - L 空）：</b>${spreadB.toFixed(2)}</div>
-        </div>
-      </body>
-      </html>
-    `);
+<div class="item"><b>Lighter BTC：</b> ${lighterBTC}</div>
 
-  } catch (err) {
-    res.send("ERROR: " + err.message);
-  }
+<div class="item"><b>Paradex Bid：</b> ${paraBid}</div>
+<div class="item"><b>Paradex Ask：</b> ${paraAsk}</div>
+
+<div class="item"><b>方向 A（L 多 - P 空）：</b> ${spreadA.toFixed(2)}</div>
+<div class="item"><b>方向 B（P 多 - L 空）：</b> ${spreadB.toFixed(2)}</div>
+
+</body>
+</html>
+        `);
+
+    } catch (err) {
+        res.send("ERROR: " + err.message);
+    }
 });
 
-app.listen(3000, () => console.log("Server started on 3000"));
+app.listen(3000, () => console.log("Server running on port 3000"));
