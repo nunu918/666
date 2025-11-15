@@ -1,105 +1,234 @@
+// server.js  —— 只用一个 Lighter 价格 + Paradex Bid/Ask + 价格曲线
+
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// 静态内存保存历史价格（用于画线）
-let priceHistory = {
+// 价差历史（最近 20 次）
+const priceHistory = {
   lighter: [],
   paraBid: [],
   paraAsk: [],
   time: []
 };
 
-function pushHistory(light, bid, ask) {
-  const now = new Date();
-  const t = now.toLocaleTimeString("zh-CN", { hour12: false });
+// 简单格式化显示
+function fmt(val) {
+  if (val == null) return "—";
+  return Number(val).toFixed(2);
+}
 
-  priceHistory.lighter.push(light ?? 0);
-  priceHistory.paraBid.push(bid ?? 0);
-  priceHistory.paraAsk.push(ask ?? 0);
+// 记录一条历史（最多 20 条）
+function pushHistory(light, bid, ask) {
+  if (light == null && bid == null && ask == null) return;
+
+  const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+
+  priceHistory.lighter.push(light);
+  priceHistory.paraBid.push(bid);
+  priceHistory.paraAsk.push(ask);
   priceHistory.time.push(t);
 
   if (priceHistory.lighter.length > 20) {
-    Object.keys(priceHistory).forEach(k => priceHistory[k].shift());
+    ["lighter", "paraBid", "paraAsk", "time"].forEach(k => priceHistory[k].shift());
   }
 }
 
 app.get("/", async (req, res) => {
-  let lighter = 0;
-  let paraBid = 0;
-  let paraAsk = 0;
+  let lighterPrice = null;
+  let paraBid = null;
+  let paraAsk = null;
 
-  // ===== 读取 Lighter =====
+  // 1. Lighter —— 只用你给的 last_trade_price 这个“一个价格”
   try {
-    const liteRes = await fetch("https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails");
-    const liteJson = await liteRes.json();
-    lighter = Number(liteJson?.order_book_details?.[0]?.last_trade_price ?? 0);
-  } catch (e) {
-    console.log("Lighter API error:", e);
+    const lightRes = await fetch(
+      "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=1"
+    );
+    const lightJson = await lightRes.json();
+
+    const rawL = Number(lightJson?.order_book_details?.[0]?.last_trade_price);
+    if (Number.isFinite(rawL)) {
+      lighterPrice = rawL;
+    }
+  } catch (err) {
+    console.log("Lighter API Error:", err.message || err);
   }
 
-  // ===== 读取 Paradox =====
+  // 2. Paradex —— 用你测试过成功的 bbo 接口
   try {
-    const paraRes = await fetch("https://api.prod.paradex.trade/v1/markets/BTC-USD-PERP/ticker");
+    const paraRes = await fetch(
+      "https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP"
+    );
     const paraJson = await paraRes.json();
-    paraBid = Number(paraJson?.bid ?? 0);
-    paraAsk = Number(paraJson?.ask ?? 0);
-  } catch (e) {
-    console.log("Paradex API error:", e);
+
+    const rawBid = Number(paraJson?.bid);
+    const rawAsk = Number(paraJson?.ask);
+
+    if (Number.isFinite(rawBid)) paraBid = rawBid;
+    if (Number.isFinite(rawAsk)) paraAsk = rawAsk;
+  } catch (err) {
+    console.log("Paradex API Error:", err.message || err);
   }
 
-  // 保存记录（用于曲线）
-  pushHistory(lighter, paraBid, paraAsk);
+  // 3. 价差计算（方向 A / 方向 B）
+  let spreadA = null; // L 多 - P 空 = Lighter - P.bid
+  let spreadB = null; // P 多 - L 空 = P.ask - Lighter
 
-  // 套利方向计算
-  const A = (lighter - paraBid).toFixed(2);
-  const B = (paraAsk - lighter).toFixed(2);
+  if (lighterPrice != null && paraBid != null) {
+    spreadA = lighterPrice - paraBid;
+  }
+  if (lighterPrice != null && paraAsk != null) {
+    spreadB = paraAsk - lighterPrice;
+  }
 
+  // 4. 推进历史（画曲线用）
+  pushHistory(lighterPrice, paraBid, paraAsk);
+
+  // 5. 输出页面（保留你原来的布局，只加一个图表）
   res.send(`
-    <html>
-    <meta charset="utf-8"/>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>BTC 套利监控（Lighter × Paradex）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui;
+      margin: 0;
+      padding: 16px;
+      background: #f5f5f7;
+    }
+    .title {
+      font-size: 24px;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 12px 16px;
+      margin-bottom: 12px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.03);
+    }
+    .label {
+      font-size: 14px;
+      color: #555;
+    }
+    .value {
+      font-size: 18px;
+      font-weight: 600;
+      margin-top: 4px;
+    }
+    .spread-title {
+      font-size: 16px;
+      font-weight: 600;
+    }
+    canvas {
+      width: 100%;
+      max-width: 640px;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="title">BTC 套利监控（Lighter × Paradex）</div>
 
-    <body style="font-family:Arial;padding:20px;">
+  <div class="card">
+    <div class="label">Lighter BTC：</div>
+    <div class="value">${fmt(lighterPrice)}</div>
+  </div>
 
-    <h2>BTC 套利监控（Lighter × Paradex）</h2>
+  <div class="card">
+    <div class="label">Paradex Bid：</div>
+    <div class="value">${fmt(paraBid)}</div>
+    <div class="label" style="margin-top:8px;">Paradex Ask：</div>
+    <div class="value">${fmt(paraAsk)}</div>
+  </div>
 
-    <div><b>Lighter BTC：</b> ${lighter}</div>
-    <div><b>Paradex Bid：</b> ${paraBid}</div>
-    <div><b>Paradex Ask：</b> ${paraAsk}</div>
+  <div class="card">
+    <div class="spread-title">方向 A（L 多 - P 空）： ${fmt(spreadA)}</div>
+    <div class="spread-title" style="margin-top:8px;">方向 B（P 多 - L 空）： ${fmt(spreadB)}</div>
+  </div>
 
-    <br>
-    <div><b>方向 A（L 多 - P 空）：</b> ${A}</div>
-    <div><b>方向 B（P 多 - L 空）：</b> ${B}</div>
+  <div class="card">
+    <div class="label" style="margin-bottom:6px;">价格曲线（最近 20 次）</div>
+    <canvas id="priceChart" height="260"></canvas>
+  </div>
 
-    <br><br>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    const labels = ${JSON.stringify(priceHistory.time)};
+    const lighterData = ${JSON.stringify(priceHistory.lighter)};
+    const paraBidData = ${JSON.stringify(priceHistory.paraBid)};
+    const paraAskData = ${JSON.stringify(priceHistory.paraAsk)};
 
-    <h3>价格曲线（最近 20 次）</h3>
-    <canvas id="chart" width="380" height="260"></canvas>
+    const ctx = document.getElementById('priceChart').getContext('2d');
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script>
-      const data = ${JSON.stringify(priceHistory)};
-
-      new Chart(
-        document.getElementById('chart'),
-        {
-          type: 'line',
-          data: {
-            labels: data.time,
-            datasets: [
-              { label:'Lighter', data:data.lighter, borderColor:'blue'},
-              { label:'Paradex Bid', data:data.paraBid, borderColor:'green'},
-              { label:'Paradex Ask', data:data.paraAsk, borderColor:'red'}
-            ]
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'Lighter',
+            data: lighterData,
+            borderWidth: 2,
+            tension: 0.2,
+            spanGaps: true
+          },
+          {
+            label: 'Paradex Bid',
+            data: paraBidData,
+            borderWidth: 2,
+            tension: 0.2,
+            spanGaps: true
+          },
+          {
+            label: 'Paradex Ask',
+            data: paraAskData,
+            borderWidth: 2,
+            tension: 0.2,
+            spanGaps: true
+          }
+        ]
+      },
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            title: { display: false }
+          },
+          y: {
+            title: { display: false },
+            ticks: {
+              callback: function(value) {
+                return value.toFixed ? value.toFixed(0) : value;
+              }
+            }
+          }
+        },
+        plugins: {
+          legend: {
+            position: 'top'
           }
         }
-      );
-    </script>
+      }
+    });
 
-    </body></html>
+    // 每 3 秒自动刷新一次页面
+    setTimeout(function () { location.reload(); }, 3000);
+  </script>
+</body>
+</html>
   `);
 });
 
-// 必须有这个!! 否则 Render 会 "Application exited early"
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Running on port", PORT));
+app.listen(PORT, () => {
+  console.log("Server listening on port", PORT);
+});
