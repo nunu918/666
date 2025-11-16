@@ -1,4 +1,4 @@
-// server.js —— 修复曲线下移 + 固定高度 + 不动你业务逻辑
+// server.js —— 移除曲线，新增 15 分钟价差统计（方向 A / B）
 
 import express from "express";
 import fetch from "node-fetch";
@@ -6,201 +6,231 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 价格历史（最近 20 条）
-const priceHistory = {
-  lighter: [],
-  paraBid: [],
-  paraAsk: [],
-  time: []
-};
+// 15 分钟窗口（毫秒）
+const WINDOW_MS = 15 * 60 * 1000;
 
-// 格式化输出
-function fmt(v) {
-  if (v == null) return "—";
-  return Number(v).toFixed(2);
+// 保存价差历史：{ ts, spreadA, spreadB }
+const spreadHistory = [];
+
+// ========= 工具函数 =========
+
+// 数字格式化（价格、价差）
+function fmt(val) {
+  if (val == null || !Number.isFinite(val)) return "—";
+  return Number(val).toFixed(2);
 }
 
-// 推入历史
-function pushHistory(l, b, a) {
-  const light = Number.isFinite(l) && l > 1000 ? l : null;
-  const bid = Number.isFinite(b) && b > 1000 ? b : null;
-  const ask = Number.isFinite(a) && a > 1000 ? a : null;
+// 带符号的格式化（+12.34 / -5.67）
+function fmtSigned(val) {
+  if (val == null || !Number.isFinite(val)) return "—";
+  const v = Number(val).toFixed(2);
+  return (val > 0 ? "+" : "") + v;
+}
 
-  if (!light && !bid && !ask) return;
+// 添加一条价差记录，并维护 15 分钟窗口
+function addSpreadSample(spreadA, spreadB) {
+  // 两个都为空就不记录
+  if (
+    (spreadA == null || !Number.isFinite(spreadA)) &&
+    (spreadB == null || !Number.isFinite(spreadB))
+  ) {
+    return;
+  }
 
-  const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const now = Date.now();
+  spreadHistory.push({ ts: now, spreadA, spreadB });
 
-  priceHistory.lighter.push(light);
-  priceHistory.paraBid.push(bid);
-  priceHistory.paraAsk.push(ask);
-  priceHistory.time.push(t);
-
-  if (priceHistory.lighter.length > 20) {
-    ["lighter", "paraBid", "paraAsk", "time"].forEach(k =>
-      priceHistory[k].shift()
-    );
+  // 只保留最近 15 分钟
+  const cutoff = now - WINDOW_MS;
+  while (spreadHistory.length && spreadHistory[0].ts < cutoff) {
+    spreadHistory.shift();
   }
 }
+
+// 计算 15 分钟统计（平均、最大、最小）
+function calcStats(key) {
+  const values = spreadHistory
+    .map((item) => item[key])
+    .filter((v) => Number.isFinite(v));
+
+  if (values.length === 0) {
+    return null;
+  }
+
+  const sum = values.reduce((a, b) => a + b, 0);
+  const avg = sum / values.length;
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+
+  return {
+    avg,
+    max,
+    min,
+    count: values.length
+  };
+}
+
+// ========= 路由 =========
 
 app.get("/", async (req, res) => {
   let lighterPrice = null;
   let paraBid = null;
   let paraAsk = null;
 
-  // Lighter
+  // 1. Lighter —— 用你给的 last_trade_price（market_id=1）
   try {
-    const r = await fetch(
+    const lightRes = await fetch(
       "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=1"
     );
-    const j = await r.json();
-    const v = Number(j?.order_book_details?.[0]?.last_trade_price);
-    if (Number.isFinite(v)) lighterPrice = v;
-  } catch (e) {
-    console.log("lighter error", e.message);
+    const lightJson = await lightRes.json();
+
+    const rawL = Number(lightJson?.order_book_details?.[0]?.last_trade_price);
+    if (Number.isFinite(rawL)) {
+      lighterPrice = rawL;
+    }
+  } catch (err) {
+    console.log("Lighter API Error:", err.message || err);
   }
 
-  // Paradex
+  // 2. Paradex —— 你测试过成功的 bbo 接口
   try {
-    const r = await fetch(
+    const paraRes = await fetch(
       "https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP"
     );
-    const j = await r.json();
-    const b = Number(j?.bid);
-    const a = Number(j?.ask);
-    if (Number.isFinite(b)) paraBid = b;
-    if (Number.isFinite(a)) paraAsk = a;
-  } catch (e) {
-    console.log("paradex error", e.message);
+    const paraJson = await paraRes.json();
+
+    const rawBid = Number(paraJson?.bid);
+    const rawAsk = Number(paraJson?.ask);
+
+    if (Number.isFinite(rawBid)) paraBid = rawBid;
+    if (Number.isFinite(rawAsk)) paraAsk = rawAsk;
+  } catch (err) {
+    console.log("Paradex API Error:", err.message || err);
   }
 
-  // 价差
-  let spreadA = null;
-  let spreadB = null;
+  // 3. 即时价差（方向 A / B）
+  let spreadA = null; // L 多 - P 空 = Lighter - P.bid
+  let spreadB = null; // P 多 - L 空 = P.ask - Lighter
 
-  if (lighterPrice != null && paraBid != null)
+  if (lighterPrice != null && paraBid != null) {
     spreadA = lighterPrice - paraBid;
-
-  if (lighterPrice != null && paraAsk != null)
+  }
+  if (lighterPrice != null && paraAsk != null) {
     spreadB = paraAsk - lighterPrice;
+  }
 
-  // 推入历史
-  pushHistory(lighterPrice, paraBid, paraAsk);
+  // 4. 记录到 15 分钟窗口
+  addSpreadSample(spreadA, spreadB);
 
-  // HTML 页面
+  // 5. 计算 15 分钟统计
+  const statsA = calcStats("spreadA");
+  const statsB = calcStats("spreadB");
+
+  // 6. 输出页面（不再有曲线，只保留监控 & 统计）
   res.send(`
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>BTC 套利监控</title>
-
-<style>
-body {
-  font-family: -apple-system, BlinkMacSystemFont, system-ui;
-  margin: 0;
-  padding: 16px;
-  background: #f5f5f7;
-}
-.card {
-  background: #fff;
-  margin-bottom: 12px;
-  padding: 12px 16px;
-  border-radius: 12px;
-}
-canvas {
-  width: 100% !important;
-  height: 260px !important;   /* 固定高度 */
-}
-</style>
-
+  <meta charset="utf-8" />
+  <title>BTC 套利监控（Lighter × Paradex）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui;
+      margin: 0;
+      padding: 16px;
+      background: #f5f5f7;
+    }
+    .title {
+      font-size: 24px;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 12px 16px;
+      margin-bottom: 12px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.03);
+    }
+    .label {
+      font-size: 14px;
+      color: #555;
+    }
+    .value {
+      font-size: 18px;
+      font-weight: 600;
+      margin-top: 4px;
+    }
+    .spread-title {
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .stat-row {
+      margin-top: 6px;
+      font-size: 14px;
+    }
+    .small {
+      font-size: 12px;
+      color: #888;
+      margin-top: 4px;
+    }
+  </style>
 </head>
 <body>
+  <div class="title">BTC 套利监控（Lighter × Paradex）</div>
 
-<h2>BTC 套利监控（Lighter × Paradex）</h2>
+  <!-- 当前价格 -->
+  <div class="card">
+    <div class="label">Lighter BTC：</div>
+    <div class="value">${fmt(lighterPrice)}</div>
+  </div>
 
-<div class="card">
-  <div>Lighter BTC：<b>${fmt(lighterPrice)}</b></div>
-</div>
+  <div class="card">
+    <div class="label">Paradex Bid：</div>
+    <div class="value">${fmt(paraBid)}</div>
+    <div class="label" style="margin-top:8px;">Paradex Ask：</div>
+    <div class="value">${fmt(paraAsk)}</div>
+  </div>
 
-<div class="card">
-  <div>Paradex Bid：<b>${fmt(paraBid)}</b></div>
-  <div>Paradex Ask：<b>${fmt(paraAsk)}</b></div>
-</div>
+  <!-- 即时价差 -->
+  <div class="card">
+    <div class="spread-title">即时价差（最新一次）</div>
+    <div class="stat-row">方向 A（L 多 - P 空）： <strong>${fmtSigned(spreadA)}</strong></div>
+    <div class="stat-row">方向 B（P 多 - L 空）： <strong>${fmtSigned(spreadB)}</strong></div>
+  </div>
 
-<div class="card">
-  <div>方向 A（L 多 - P 空）：<b>${fmt(spreadA)}</b></div>
-  <div>方向 B（P 多 - L 空）：<b>${fmt(spreadB)}</b></div>
-</div>
+  <!-- 15 分钟统计 -->
+  <div class="card">
+    <div class="spread-title">15 分钟价差统计（滚动窗口）</div>
 
-<div class="card">
-  <div style="margin-bottom:6px;">价格曲线（最近 20 次）</div>
-  <canvas id="priceChart"></canvas>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script>
-const labels = ${JSON.stringify(priceHistory.time)};
-const rawL = ${JSON.stringify(priceHistory.lighter)};
-const rawB = ${JSON.stringify(priceHistory.paraBid)};
-const rawA = ${JSON.stringify(priceHistory.paraAsk)};
-
-function fix(v){ return (v==null||!isFinite(v))?undefined:v; }
-
-const lighterData = rawL.map(fix);
-const paraBidData = rawB.map(fix);
-const paraAskData = rawA.map(fix);
-
-// 计算稳定 Y轴范围
-const all = rawL.concat(rawB, rawA).filter(v => typeof v==="number");
-let yMin, yMax;
-if (all.length > 0){
-  const min = Math.min(...all);
-  const max = Math.max(...all);
-  const pad = (max-min)*0.2 || 20;
-  yMin = min - pad;
-  yMax = max + pad;
-}
-
-let chart;
-
-function renderChart(){
-  if(chart) chart.destroy();   // 关键：销毁旧图避免下移累积
-
-  const ctx = document.getElementById("priceChart").getContext("2d");
-
-  chart = new Chart(ctx,{
-    type:"line",
-    data:{
-      labels,
-      datasets:[
-        { label:"Lighter", data: lighterData, borderColor:"blue", backgroundColor:"blue", tension:0.25 },
-        { label:"Paradex Bid", data: paraBidData, borderColor:"green", backgroundColor:"green", tension:0.25 },
-        { label:"Paradex Ask", data: paraAskData, borderColor:"red", backgroundColor:"red", tension:0.25 }
-      ]
-    },
-    options:{
-      responsive:true,
-      animation:false,
-      maintainAspectRatio:false,
-      scales:{
-        y:{ min:yMin, max:yMax }
-      }
+    <div class="stat-row" style="margin-top:8px;">
+      <strong>方向 A（L 多 - P 空）</strong>
+    </div>
+    ${
+      statsA
+        ? `
+      <div class="stat-row">平均：${fmtSigned(statsA.avg)}</div>
+      <div class="stat-row">最高：${fmtSigned(statsA.max)}</div>
+      <div class="stat-row">最低：${fmtSigned(statsA.min)}</div>
+      <div class="small">样本数量：${statsA.count} 次</div>
+      `
+        : `<div class="stat-row">暂无足够数据（少于一两次刷新）</div>`
     }
-  });
-}
 
-renderChart();
+    <div class="stat-row" style="margin-top:12px;">
+      <strong>方向 B（P 多 - L 空）</strong>
+    </div>
+    ${
+      statsB
+        ? `
+      <div class="stat-row">平均：${fmtSigned(statsB.avg)}</div>
+      <div class="stat-row">最高：${fmtSigned(statsB.max)}</div>
+      <div class="stat-row">最低：${fmtSigned(statsB.min)}</div>
+      <div class="small">样本数量：${statsB.count} 次</div>
+      `
+        : `<div class="stat-row">暂无足够数据（少于一两次刷新）</div>`
+    }
 
-// 自动刷新
-setTimeout(()=>location.reload(), 3000);
-</script>
-
-</body>
-</html>
-  `);
-});
-
-app.listen(PORT, () => {
-  console.log("server running", PORT);
-});
+    <div class="small" style="margin-top:10px;">
+      窗口长度：最近 15 分钟 · 刷新频率：约 3
