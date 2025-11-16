@@ -234,3 +234,11 @@ app.get("/", async (req, res) => {
 
     <div class="small" style="margin-top:10px;">
       窗口长度：最近 15 分钟 · 刷新频率：约 3
+// -----------------------------
+// Render 必须监听外部端口，否则服务会直接退出
+// -----------------------------
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Server RUNNING on port", PORT);
+});
