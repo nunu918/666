@@ -1,4 +1,4 @@
-// server.js —— 移除曲线，新增 15 分钟价差统计（方向 A / B）
+// server.js —— 后台自动抓价差 + 15分钟统计，网页只显示结果
 
 import express from "express";
 import fetch from "node-fetch";
@@ -12,65 +12,58 @@ const WINDOW_MS = 15 * 60 * 1000;
 // 保存价差历史：{ ts, spreadA, spreadB }
 const spreadHistory = [];
 
-// ========= 工具函数 =========
+// 当前最新价格（给网页用）
+let lighterPrice = null;
+let paraBid = null;
+let paraAsk = null;
+let spreadA = null;
+let spreadB = null;
 
-// 数字格式化（价格、价差）
+// ========= 工具函数 =========
 function fmt(val) {
   if (val == null || !Number.isFinite(val)) return "—";
   return Number(val).toFixed(2);
 }
 
-// 带符号的格式化（+12.34 / -5.67）
 function fmtSigned(val) {
   if (val == null || !Number.isFinite(val)) return "—";
-  const v = Number(val).toFixed(2);
-  return (val > 0 ? "+" : "") + v;
+  return (val > 0 ? "+" : "") + Number(val).toFixed(2);
 }
 
-// 添加一条价差记录，并维护 15 分钟窗口
-function addSpreadSample(spreadA, spreadB) {
-  if (
-    (spreadA == null || !Number.isFinite(spreadA)) &&
-    (spreadB == null || !Number.isFinite(spreadB))
-  ) {
-    return;
-  }
+function addSpreadSample() {
+  if (!Number.isFinite(spreadA) && !Number.isFinite(spreadB)) return;
 
   const now = Date.now();
   spreadHistory.push({ ts: now, spreadA, spreadB });
 
-  // 只保留最近 15 分钟
+  // 保留最近 15 分钟
   const cutoff = now - WINDOW_MS;
   while (spreadHistory.length && spreadHistory[0].ts < cutoff) {
     spreadHistory.shift();
   }
 }
 
-// 计算 15 分钟统计（平均、最大、最小）
 function calcStats(key) {
   const values = spreadHistory
-    .map((item) => item[key])
+    .map((i) => i[key])
     .filter((v) => Number.isFinite(v));
 
   if (values.length === 0) return null;
 
   const sum = values.reduce((a, b) => a + b, 0);
-  const avg = sum / values.length;
-  const max = Math.max(...values);
-  const min = Math.min(...values);
-
-  return { avg, max, min, count: values.length };
+  return {
+    avg: sum / values.length,
+    max: Math.max(...values),
+    min: Math.min(...values),
+    count: values.length
+  };
 }
 
-// ========= 路由 =========
+// ========= 核心：后台每 3 秒自动抓取 =========
 
-app.get("/", async (req, res) => {
-  let lighterPrice = null;
-  let paraBid = null;
-  let paraAsk = null;
-
-  // 1. Lighter 价格
+async function fetchPrices() {
   try {
+    // Lighter
     const lightRes = await fetch(
       "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=1"
     );
@@ -78,11 +71,11 @@ app.get("/", async (req, res) => {
     const rawL = Number(lightJson?.order_book_details?.[0]?.last_trade_price);
     if (Number.isFinite(rawL)) lighterPrice = rawL;
   } catch (err) {
-    console.log("Lighter API Error:", err.message);
+    console.log("Lighter API Error:", err.message || err);
   }
 
-  // 2. Paradex BBO
   try {
+    // Paradex
     const paraRes = await fetch(
       "https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP"
     );
@@ -92,103 +85,105 @@ app.get("/", async (req, res) => {
     if (Number.isFinite(rawBid)) paraBid = rawBid;
     if (Number.isFinite(rawAsk)) paraAsk = rawAsk;
   } catch (err) {
-    console.log("Paradex API Error:", err.message);
+    console.log("Paradex API Error:", err.message || err);
   }
 
-  // 3. 即时价差
-  let spreadA = lighterPrice != null && paraBid != null ? lighterPrice - paraBid : null;
-  let spreadB = lighterPrice != null && paraAsk != null ? paraAsk - lighterPrice : null;
+  // 计算价差
+  if (Number.isFinite(lighterPrice) && Number.isFinite(paraBid)) {
+    spreadA = lighterPrice - paraBid;
+  }
+  if (Number.isFinite(lighterPrice) && Number.isFinite(paraAsk)) {
+    spreadB = paraAsk - lighterPrice;
+  }
 
-  // 4. 推入 15 分钟窗口
-  addSpreadSample(spreadA, spreadB);
+  // 写入 15 分钟窗口
+  addSpreadSample();
+}
 
-  // 5. 统计结果
+// 后台自动抓取（每 3 秒）
+setInterval(fetchPrices, 3000);
+fetchPrices(); // 初始化先抓一次
+
+// ========= 网页路由（只读数据） =========
+
+app.get("/", (req, res) => {
   const statsA = calcStats("spreadA");
   const statsB = calcStats("spreadB");
 
-  // 6. 页面输出
   res.send(`
 <!doctype html>
-<html lang="zh-CN">
+<html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>BTC 套利监控（Lighter × Paradex）</title>
+  <title>BTC 套利监控（后台实时）</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, system-ui; padding: 16px; background:#f5f5f7; }
-    .title { font-size:24px; font-weight:700; margin-bottom:16px; }
-    .card { background:#fff; border-radius:12px; padding:12px 16px; margin-bottom:12px; }
-    .label { font-size:14px; color:#555; }
-    .value { font-size:18px; font-weight:600; margin-top:4px; }
-    .spread-title { font-size:16px; font-weight:600; }
-    .stat-row { margin-top:6px; font-size:14px; }
-    .small { font-size:12px; color:#888; margin-top:4px; }
+    body { font-family: -apple-system; padding: 16px; background: #f5f5f7;}
+    .card { background: #fff; padding: 16px; margin-bottom: 12px;
+            border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);}
+    .title { font-size: 24px; font-weight: 700; margin-bottom: 16px;}
+    .label { font-size: 14px; color: #666;}
+    .value { font-size: 20px; font-weight: 600; margin-top: 6px;}
+    .stat { font-size: 15px; margin-top: 6px;}
+    .small { font-size: 12px; color: #777; margin-top: 6px;}
   </style>
 </head>
 <body>
 
-<div class="title">BTC 套利监控（Lighter × Paradex）</div>
+  <div class="title">BTC 套利监控（后台实时）</div>
 
-<div class="card">
-  <div class="label">Lighter BTC：</div>
-  <div class="value">${fmt(lighterPrice)}</div>
-</div>
+  <div class="card">
+    <div class="label">Lighter BTC：</div>
+    <div class="value">${fmt(lighterPrice)}</div>
+  </div>
 
-<div class="card">
-  <div class="label">Paradex Bid：</div>
-  <div class="value">${fmt(paraBid)}</div>
-  <div class="label" style="margin-top:8px;">Paradex Ask：</div>
-  <div class="value">${fmt(paraAsk)}</div>
-</div>
+  <div class="card">
+    <div class="label">Paradex Bid：</div>
+    <div class="value">${fmt(paraBid)}</div>
+    <div class="label" style="margin-top:8px;">Paradex Ask：</div>
+    <div class="value">${fmt(paraAsk)}</div>
+  </div>
 
-<div class="card">
-  <div class="spread-title">即时价差（最新）</div>
-  <div class="stat-row">方向 A： <strong>${fmtSigned(spreadA)}</strong></div>
-  <div class="stat-row">方向 B： <strong>${fmtSigned(spreadB)}</strong></div>
-</div>
+  <div class="card">
+    <div class="label">即时价差</div>
+    <div class="stat">方向 A（L 多 - P 空）： <strong>${fmtSigned(spreadA)}</strong></div>
+    <div class="stat">方向 B（P 多 - L 空）： <strong>${fmtSigned(spreadB)}</strong></div>
+  </div>
 
-<div class="card">
-  <div class="spread-title">15 分钟统计</div>
+  <div class="card">
+    <div class="label">15 分钟统计（后台持续）</div>
 
-  <div class="stat-row" style="margin-top:8px;"><strong>方向 A</strong></div>
-  ${
-    statsA
-      ? `
-      <div class="stat-row">平均：${fmtSigned(statsA.avg)}</div>
-      <div class="stat-row">最高：${fmtSigned(statsA.max)}</div>
-      <div class="stat-row">最低：${fmtSigned(statsA.min)}</div>
-      <div class="small">样本数：${statsA.count} 次</div>
-      `
-      : `<div class="stat-row">暂无数据</div>`
-  }
+    <div style="margin-top:10px;"><strong>方向 A</strong></div>
+    ${
+      statsA
+        ? `
+      <div class="stat">平均：${fmtSigned(statsA.avg)}</div>
+      <div class="stat">最高：${fmtSigned(statsA.max)}</div>
+      <div class="stat">最低：${fmtSigned(statsA.min)}</div>
+      <div class="small">样本：${statsA.count} 次</div>`
+        : `<div class="stat">暂无数据</div>`
+    }
 
-  <div class="stat-row" style="margin-top:12px;"><strong>方向 B</strong></div>
-  ${
-    statsB
-      ? `
-      <div class="stat-row">平均：${fmtSigned(statsB.avg)}</div>
-      <div class="stat-row">最高：${fmtSigned(statsB.max)}</div>
-      <div class="stat-row">最低：${fmtSigned(statsB.min)}</div>
-      <div class="small">样本数：${statsB.count} 次</div>
-      `
-      : `<div class="stat-row">暂无数据</div>`
-  }
+    <div style="margin-top:12px;"><strong>方向 B</strong></div>
+    ${
+      statsB
+        ? `
+      <div class="stat">平均：${fmtSigned(statsB.avg)}</div>
+      <div class="stat">最高：${fmtSigned(statsB.max)}</div>
+      <div class="stat">最低：${fmtSigned(statsB.min)}</div>
+      <div class="small">样本：${statsB.count} 次</div>`
+        : `<div class="stat">暂无数据</div>`
+    }
 
-  <div class="small" style="margin-top:10px;">窗口长度：最近 15 分钟 · 自动刷新每 3 秒</div>
-</div>
-
-<script>
-  setTimeout(() => location.reload(), 3000);
-</script>
+    <div class="small">窗口：最近 15 分钟 · 后台每 3 秒抓一次</div>
+  </div>
 
 </body>
 </html>
-  `);
+`);
 });
 
-// =======================
-// Render 必须监听端口
-// =======================
+// Render 必须监听 0.0.0.0
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("Server RUNNING on port", PORT);
+  console.log("Server RUNNING on", PORT);
 });
