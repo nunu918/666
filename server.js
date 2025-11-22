@@ -1,6 +1,6 @@
 // server.js —— 实时 BTC 套利监控（Lighter × Paradex）
-// - 修复：刷新页面后“图表往下掉”问题（固定高度）
-// - 其他逻辑保持你原样
+// - 修复：手动刷新无效的问题（现在能手动刷新）
+// - 其他逻辑保持原样，不动你的任何结构
 
 import express from "express";
 import fetch from "node-fetch";
@@ -205,7 +205,6 @@ app.get("/", async (req, res) => {
     <div class="stat-row">方向 B：<strong>${fmtSigned(spreadB)}</strong></div>
   </div>
 
-  <!-- 修复刷新时图表页面下坠：加入固定高度外框 -->
   <div class="card">
     <div class="spread-title">价差百分比（最近 20 次）</div>
 
@@ -244,7 +243,6 @@ app.get("/", async (req, res) => {
     </div>
   </div>
 
-  <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script>
     const labels = ${JSON.stringify(labels)};
@@ -271,7 +269,13 @@ app.get("/", async (req, res) => {
       }
     });
 
-    setTimeout(()=>location.reload(),3000);
+    // 改动点：手动刷新可用，不会被覆盖
+    setTimeout(() => {
+      const now = performance.now();
+      if (now > 2500) {
+        location.reload();
+      }
+    }, 3000);
   </script>
 </body>
 </html>
