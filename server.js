@@ -1,4 +1,8 @@
-// server.js —— 方案 A：前端不 reload，后台 API 刷新数据
+// server.js —— 实时 BTC 套利监控（Lighter × Paradex）
+// - 手动刷新页面：立即重新获取 API（核心修复）
+// - 自动刷新 3 秒保持不变
+// - 无折线图版本（按你最新要求）
+// - 保留 15 分钟统计窗口
 
 import express from "express";
 import fetch from "node-fetch";
@@ -8,237 +12,228 @@ const PORT = process.env.PORT || 3000;
 
 // 15 分钟窗口
 const WINDOW_MS = 15 * 60 * 1000;
-// 后端采样频率：3 秒
-const SAMPLE_INTERVAL_MS = 3000;
-// 最大图表样本数（虽然你取消图表，但保留结构）
-const MAX_POINTS = 20;
 
-// 存储样本
+// 后台采样间隔
+const SAMPLE_INTERVAL_MS = 3000;
+
+// 历史样本：{ ts, lighter, paraBid, paraAsk }
 const samples = [];
 
-/* --------------------------
- 工具函数
---------------------------- */
-function fmt(v) {
-  if (v == null || !Number.isFinite(v)) return "—";
-  return Number(v).toFixed(2);
-}
-function fmtSigned(v) {
-  if (v == null || !Number.isFinite(v)) return "—";
-  const n = Number(v).toFixed(2);
-  return (v > 0 ? "+" : "") + n;
+// ---------------- 工具函数 ----------------
+
+function fmt(val) {
+  if (val == null || !Number.isFinite(val)) return "—";
+  return Number(val).toFixed(2);
 }
 
-/* --------------------------
- 拉取价格（Lighter + Paradex）
---------------------------- */
+function fmtSigned(val) {
+  if (val == null || !Number.isFinite(val)) return "—";
+  const v = Number(val).toFixed(2);
+  return (val > 0 ? "+" : "") + v;
+}
+
+// ---------------- API 拉取 ----------------
+
 async function fetchPrices() {
-  let lighter = null;
-  let bid = null;
-  let ask = null;
+  let lighterPrice = null;
+  let paraBid = null;
+  let paraAsk = null;
 
+  // Lighter
   try {
-    const r = await fetch(
+    const lightRes = await fetch(
       "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=1"
     );
-    const j = await r.json();
-    const raw = Number(j?.order_book_details?.[0]?.last_trade_price);
-    if (Number.isFinite(raw)) lighter = raw;
+    const lightJson = await lightRes.json();
+    const rawL = Number(lightJson?.order_book_details?.[0]?.last_trade_price);
+    if (Number.isFinite(rawL)) lighterPrice = rawL;
   } catch {}
 
+  // Paradex
   try {
-    const r = await fetch(
+    const paraRes = await fetch(
       "https://api.prod.paradex.trade/v1/bbo/BTC-USD-PERP"
     );
-    const j = await r.json();
-    const rawBid = Number(j?.bid);
-    const rawAsk = Number(j?.ask);
-    if (Number.isFinite(rawBid)) bid = rawBid;
-    if (Number.isFinite(rawAsk)) ask = rawAsk;
+    const paraJson = await paraRes.json();
+    const rawBid = Number(paraJson?.bid);
+    const rawAsk = Number(paraJson?.ask);
+    if (Number.isFinite(rawBid)) paraBid = rawBid;
+    if (Number.isFinite(rawAsk)) paraAsk = rawAsk;
   } catch {}
 
-  return { lighter, bid, ask };
+  return { lighterPrice, paraBid, paraAsk };
 }
 
-/* --------------------------
- 后端采样
---------------------------- */
+// ---------------- 样本记录 ----------------
+
 async function takeSample() {
-  const { lighter, bid, ask } = await fetchPrices();
+  const { lighterPrice, paraBid, paraAsk } = await fetchPrices();
   const now = Date.now();
 
-  if (lighter == null && bid == null && ask == null) return;
+  if (
+    lighterPrice == null &&
+    paraBid == null &&
+    paraAsk == null
+  )
+    return;
 
-  samples.push({ ts: now, lighter, bid, ask });
+  samples.push({
+    ts: now,
+    lighter: lighterPrice,
+    paraBid,
+    paraAsk
+  });
 
-  // 删除过期数据（15 分钟窗口）
+  // 保留最近 15 分钟
   const cutoff = now - WINDOW_MS;
   while (samples.length && samples[0].ts < cutoff) samples.shift();
 }
-setInterval(takeSample, SAMPLE_INTERVAL_MS);
-takeSample();
 
-/* --------------------------
- 计算统计
---------------------------- */
-function computeStats(samples) {
-  let A = [];
-  let B = [];
+// ---------------- 15 分钟统计 ----------------
+
+function calcStats(directionKey) {
+  const now = Date.now();
+  const cutoff = now - WINDOW_MS;
+  const values = [];
 
   for (const s of samples) {
-    if (s.lighter != null && s.bid != null)
-      A.push(s.lighter - s.bid);
+    if (s.ts < cutoff) continue;
 
-    if (s.lighter != null && s.ask != null)
-      B.push(s.ask - s.lighter);
+    let spread = null;
+
+    if (directionKey === "A" && s.lighter != null && s.paraBid != null)
+      spread = s.lighter - s.paraBid;
+
+    if (directionKey === "B" && s.lighter != null && s.paraAsk != null)
+      spread = s.paraAsk - s.lighter;
+
+    if (spread != null && Number.isFinite(spread)) values.push(spread);
   }
 
-  function stat(arr) {
-    if (!arr.length) return null;
-    return {
-      avg: arr.reduce((a, b) => a + b, 0) / arr.length,
-      max: Math.max(...arr),
-      min: Math.min(...arr),
-      count: arr.length
-    };
-  }
+  if (!values.length) return null;
 
-  return { statsA: stat(A), statsB: stat(B) };
+  return {
+    avg: values.reduce((a, b) => a + b, 0) / values.length,
+    max: Math.max(...values),
+    min: Math.min(...values),
+    count: values.length
+  };
 }
 
-/* --------------------------
-  API：前端每 3 秒请求一次
---------------------------- */
-app.get("/api/data", (req, res) => {
-  const last = samples[samples.length - 1] ?? {};
+// ---------------- 后台定时采样 ----------------
 
-  const lighter = last.lighter ?? null;
-  const bid = last.bid ?? null;
-  const ask = last.ask ?? null;
+setInterval(() => {
+  takeSample().catch(() => {});
+}, SAMPLE_INTERVAL_MS);
+
+// 启动立即采样一次
+takeSample();
+
+// ---------------- 页面路由 ----------------
+
+app.get("/", async (req, res) => {
+
+  // ★★★★★ 本次最重要修复点 ★★★★★
+  // 页面手动刷新时立即拉最新 API，不用等 3 秒后台任务
+  await takeSample();
+
+  const last = samples[samples.length - 1] ?? {};
+  const lighterPrice = last.lighter ?? null;
+  const paraBid = last.paraBid ?? null;
+  const paraAsk = last.paraAsk ?? null;
 
   const spreadA =
-    lighter != null && bid != null ? lighter - bid : null;
+    lighterPrice != null && paraBid != null
+      ? lighterPrice - paraBid
+      : null;
 
   const spreadB =
-    lighter != null && ask != null ? ask - lighter : null;
+    lighterPrice != null && paraAsk != null
+      ? paraAsk - lighterPrice
+      : null;
 
-  const { statsA, statsB } = computeStats(samples);
+  const statsA = calcStats("A");
+  const statsB = calcStats("B");
 
-  res.json({
-    lighter,
-    bid,
-    ask,
-    spreadA,
-    spreadB,
-    statsA,
-    statsB
-  });
-});
-
-/* --------------------------
- 页面（前端 AJAX 自动更新）
---------------------------- */
-app.get("/", (req, res) => {
   res.send(`
 <!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8" />
-<title>BTC 套利监控（Lighter × Paradex）</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-body { 
-  font-family:-apple-system, BlinkMacSystemFont; 
-  margin:0; padding:16px; background:#f5f5f7;
-}
-.card {
-  background:#fff; padding:16px; border-radius:12px;
-  margin-bottom:12px; box-shadow:0 2px 4px rgba(0,0,0,0.05);
-}
-.label { font-size:14px; color:#555; }
-.value { font-size:20px; font-weight:600; margin-top:4px; }
-.spread-title { font-size:16px; font-weight:600; margin-bottom:6px; }
-.stat-row { margin-top:6px; font-size:14px; }
-.small { font-size:12px; color:#888; margin-top:6px; }
-</style>
+  <meta charset="utf-8" />
+  <title>BTC 套利监控（Lighter × Paradex）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont; margin:0; padding:16px; background:#f5f5f7; }
+    .title { font-size:24px; font-weight:700; margin-bottom:16px; }
+    .card {
+      background:#fff; border-radius:12px; padding:12px 16px; margin-bottom:12px;
+      box-shadow:0 2px 4px rgba(0,0,0,0.03);
+    }
+    .label { font-size:14px; color:#555; }
+    .value { font-size:18px; font-weight:600; margin-top:4px; }
+    .spread-title { font-size:16px; font-weight:600; }
+    .stat-row { margin-top:6px; font-size:14px; }
+    .small { font-size:12px; color:#888; margin-top:4px; }
+  </style>
 </head>
 <body>
 
-<h2>BTC 套利监控（Lighter × Paradex）</h2>
+  <div class="title">BTC 套利监控（L × P）</div>
 
-<div class="card">
-  <div class="label">Lighter BTC：</div>
-  <div class="value" id="lighter">—</div>
-</div>
+  <div class="card">
+    <div class="label">Lighter BTC：</div>
+    <div class="value">${fmt(lighterPrice)}</div>
+  </div>
 
-<div class="card">
-  <div class="label">Paradex Bid：</div>
-  <div class="value" id="bid">—</div>
-  <div class="label" style="margin-top:8px;">Paradex Ask：</div>
-  <div class="value" id="ask">—</div>
-</div>
+  <div class="card">
+    <div class="label">Paradex Bid：</div>
+    <div class="value">${fmt(paraBid)}</div>
+    <div class="label" style="margin-top:8px;">Paradex Ask：</div>
+    <div class="value">${fmt(paraAsk)}</div>
+  </div>
 
-<div class="card">
-  <div class="spread-title">即时价差</div>
-  <div class="stat-row">方向 A：<strong id="spreadA">—</strong></div>
-  <div class="stat-row">方向 B：<strong id="spreadB">—</strong></div>
-</div>
+  <div class="card">
+    <div class="spread-title">即时价差（最新一次）</div>
+    <div class="stat-row">方向 A（买 L / 卖 P）：<strong>${fmtSigned(spreadA)}</strong></div>
+    <div class="stat-row">方向 B（买 P / 卖 L）：<strong>${fmtSigned(spreadB)}</strong></div>
+  </div>
 
-<div class="card">
-  <div class="spread-title">15 分钟统计</div>
+  <div class="card">
+    <div class="spread-title">15 分钟统计</div>
 
-  <div class="stat-row"><strong>方向 A</strong></div>
-  <div class="stat-row" id="statsA">暂无数据</div>
+    <div class="stat-row"><strong>方向 A</strong></div>
+    ${
+      statsA
+        ? `
+        <div class="stat-row">平均：${fmtSigned(statsA.avg)}</div>
+        <div class="stat-row">最高：${fmtSigned(statsA.max)}</div>
+        <div class="stat-row">最低：${fmtSigned(statsA.min)}</div>
+        <div class="small">样本数：${statsA.count} 次</div>`
+        : `<div class="stat-row">暂无数据</div>`
+    }
 
-  <div class="stat-row" style="margin-top:12px;"><strong>方向 B</strong></div>
-  <div class="stat-row" id="statsB">暂无数据</div>
+    <div class="stat-row" style="margin-top:12px;"><strong>方向 B</strong></div>
+    ${
+      statsB
+        ? `
+        <div class="stat-row">平均：${fmtSigned(statsB.avg)}</div>
+        <div class="stat-row">最高：${fmtSigned(statsB.max)}</div>
+        <div class="stat-row">最低：${fmtSigned(statsB.min)}</div>
+        <div class="small">样本数：${statsB.count} 次</div>`
+        : `<div class="stat-row">暂无数据</div>`
+    }
 
-  <div class="small">后台采样：3 秒 / 页面无刷新自动更新</div>
-</div>
-
-<script>
-function fmt(v){ return (v==null||isNaN(v)) ? "—" : Number(v).toFixed(2); }
-function fmtS(v){ return (v==null||isNaN(v)) ? "—" : ((v>0?"+":"")+Number(v).toFixed(2)); }
-
-async function update(){
-  const res = await fetch("/api/data");
-  const j = await res.json();
-
-  document.getElementById("lighter").innerText = fmt(j.lighter);
-  document.getElementById("bid").innerText = fmt(j.bid);
-  document.getElementById("ask").innerText = fmt(j.ask);
-
-  document.getElementById("spreadA").innerText = fmtS(j.spreadA);
-  document.getElementById("spreadB").innerText = fmtS(j.spreadB);
-
-  if (j.statsA)
-    document.getElementById("statsA").innerText =
-      "平均：" + fmtS(j.statsA.avg) +
-      "　最高：" + fmtS(j.statsA.max) +
-      "　最低：" + fmtS(j.statsA.min) +
-      "　样本：" + j.statsA.count;
-
-  if (j.statsB)
-    document.getElementById("statsB").innerText =
-      "平均：" + fmtS(j.statsB.avg) +
-      "　最高：" + fmtS(j.statsB.max) +
-      "　最低：" + fmtS(j.statsB.min) +
-      "　样本：" + j.statsB.count;
-}
-
-// 自动更新（不刷新页面）
-setInterval(update, 3000);
-update();
-</script>
+    <div class="small" style="margin-top:10px;">
+      后台采样：3 秒一次 · 页面可手动刷新看到最新价差
+    </div>
+  </div>
 
 </body>
 </html>
-`);
+  `);
 });
 
-/* --------------------------
- Render 启动
---------------------------- */
+// -------------------- 启动服务器 --------------------
 app.listen(PORT, "0.0.0.0", () =>
-  console.log("Server running on", PORT)
+  console.log("Server RUNNING on port", PORT)
 );
