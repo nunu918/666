@@ -191,6 +191,15 @@ app.get("/", async (req, res) => {
     background:#fff; border-radius:14px; padding:18px; margin-bottom:14px;
     box-shadow:0 2px 5px rgba(0,0,0,0.05);
   }
+  .card-row {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .card-row .card {
+    flex: 1 1 320px;
+    margin-bottom: 0;
+  }
   .label { font-size:17px; color:#666; }
   .value { font-size:23px; font-weight:700; margin-top:6px; }
   .spread-title { font-size:20px; font-weight:700; }
@@ -211,16 +220,18 @@ app.get("/", async (req, res) => {
 
 <div class="title">BTC / ETH 套利监控（L × P）</div>
 
-<div class="card">
-  <div class="spread-title">BTC 即时价差</div>
-  <div class="stat-row">方向 A（买 L / 卖 P）：<strong>${fmtSigned(spreadA)}</strong></div>
-  <div class="stat-row">方向 B（买 P / 卖 L）：<strong>${fmtSigned(spreadB)}</strong></div>
-</div>
+<div class="card-row">
+  <div class="card">
+    <div class="spread-title">BTC 即时价差</div>
+    <div class="stat-row">方向 A（买 L / 卖 P）：<strong>${fmtSigned(spreadA)}</strong></div>
+    <div class="stat-row">方向 B（买 P / 卖 L）：<strong>${fmtSigned(spreadB)}</strong></div>
+  </div>
 
-<div class="card">
-  <div class="spread-title">ETH 即时价差</div>
-  <div class="stat-row">方向 A（买 L / 卖 P）：<strong>${fmtSigned(ethSpreadA)}</strong></div>
-  <div class="stat-row">方向 B（买 P / 卖 L）：<strong>${fmtSigned(ethSpreadB)}</strong></div>
+  <div class="card">
+    <div class="spread-title">ETH 即时价差</div>
+    <div class="stat-row">方向 A（买 L / 卖 P）：<strong>${fmtSigned(ethSpreadA)}</strong></div>
+    <div class="stat-row">方向 B（买 P / 卖 L）：<strong>${fmtSigned(ethSpreadB)}</strong></div>
+  </div>
 </div>
 
 <div class="card">
